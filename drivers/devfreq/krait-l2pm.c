@@ -151,6 +151,17 @@ static void mon_bw_init(void)
 	set_l2_indirect_reg(L2PMnEVTYPER(WR_MON), 0xB);
 }
 
+/* Returns MBps of read/writes for the sampling window. */
+static unsigned int beats_to_mbps(long long beats, unsigned int us)
+{
+	beats *= USEC_PER_SEC;
+	beats *= bytes_per_beat;
+	do_div(beats, us);
+	beats = DIV_ROUND_UP_ULL(beats, SZ_1M);
+
+	return beats;
+}
+
 static unsigned int mbps_to_beats(unsigned long mbps, unsigned int ms,
 				  unsigned int tolerance_percent)
 {
@@ -161,36 +172,23 @@ static unsigned int mbps_to_beats(unsigned long mbps, unsigned int ms,
 	return mbps;
 }
 
-static unsigned long get_bytes_and_clear(struct bw_hwmon *hw)
+static unsigned long meas_bw_and_set_irq(struct bw_hwmon *hw,
+					 unsigned int tol, unsigned int us)
 {
-	unsigned long r_count, w_count;
-
-	mon_disable(RD_MON);
-	mon_disable(WR_MON);
-
-	r_count = mon_get_count(RD_MON, prev_r_start_val);
-	w_count = mon_get_count(WR_MON, prev_w_start_val);
-
-	mon_enable(RD_MON);
-	mon_enable(WR_MON);
-
-	return r_count + w_count;
-}
-
-static unsigned long set_thres(struct bw_hwmon *hw, unsigned long bytes)
-{
-	unsigned long r_count, w_count, t_count;
+	unsigned long r_mbps, w_mbps;
 	u32 r_limit, w_limit;
+	unsigned int sample_ms = hw->df->profile->polling_ms;
 
 	mon_disable(RD_MON);
 	mon_disable(WR_MON);
 
-	r_count = mon_get_count(RD_MON, prev_r_start_val);
-	w_count = mon_get_count(WR_MON, prev_w_start_val);
+	r_mbps = mon_get_count(RD_MON, prev_r_start_val);
+	r_mbps = beats_to_mbps(r_mbps, us);
+	w_mbps = mon_get_count(WR_MON, prev_w_start_val);
+	w_mbps = beats_to_mbps(w_mbps, us);
 
-	t_count = r_count + w_count;
-	r_limit = bytes * (r_count * 100 / t_count);
-	w_limit = bytes * (w_count * 100 / t_count);
+	r_limit = mbps_to_beats(r_mbps, sample_ms, tol);
+	w_limit = mbps_to_beats(w_mbps, sample_ms, tol);
 
 	prev_r_start_val = mon_set_limit(RD_MON, r_limit);
 	prev_w_start_val = mon_set_limit(WR_MON, w_limit);
@@ -198,29 +196,19 @@ static unsigned long set_thres(struct bw_hwmon *hw, unsigned long bytes)
 	mon_enable(RD_MON);
 	mon_enable(WR_MON);
 
-	return t_count;
-}
+	pr_debug("R/W = %ld/%ld\n", r_mbps, w_mbps);
 
-static u32 get_bytes_per_beat(void)
-{
-	return bytes_per_beat;
+	return r_mbps + w_mbps;
 }
 
 static irqreturn_t bwmon_intr_handler(int irq, void *dev)
 {
-	if (!mon_overflow(RD_MON) || !mon_overflow(WR_MON))
-		return IRQ_NONE;
+	if (mon_overflow(RD_MON) || mon_overflow(WR_MON)) {
+		update_bw_hwmon(dev);
+		return IRQ_HANDLED;
+	}
 
-	if (bw_hwmon_sample_end(dev) > 0)
-		return IRQ_WAKE_THREAD;
-
-	return IRQ_HANDLED;
-}
-
-static irqreturn_t bwmon_intr_thread(int irq, void *dev)
-{
-	update_bw_hwmon(dev);
-	return IRQ_HANDLED;
+	return IRQ_NONE;
 }
 
 static int start_bw_hwmon(struct bw_hwmon *hw, unsigned long mbps)
@@ -228,8 +216,7 @@ static int start_bw_hwmon(struct bw_hwmon *hw, unsigned long mbps)
 	u32 limit;
 	int ret;
 
-	ret = request_threaded_irq(bw_irq, bwmon_intr_handler,
-				  bwmon_intr_thread,
+	ret = request_threaded_irq(bw_irq, NULL, bwmon_intr_handler,
 				  IRQF_ONESHOT | IRQF_SHARED,
 				  "bw_hwmon", hw);
 	if (ret) {
@@ -273,9 +260,7 @@ static struct devfreq_governor devfreq_gov_cpubw_hwmon = {
 static struct bw_hwmon cpubw_hwmon = {
 	.start_hwmon = &start_bw_hwmon,
 	.stop_hwmon = &stop_bw_hwmon,
-	.get_bytes_and_clear = &get_bytes_and_clear,
-	.set_thres = &set_thres,
-	.get_bytes_per_beat = &get_bytes_per_beat,
+	.meas_bw_and_set_irq = &meas_bw_and_set_irq,
 	.gov = &devfreq_gov_cpubw_hwmon,
 };
 
@@ -314,13 +299,13 @@ static unsigned int mrps_to_count(unsigned int mrps, unsigned int ms,
 	return mrps;
 }
 
-static unsigned long meas_mrps_and_set_irq(struct cache_hwmon *hw,
+static unsigned long meas_mrps_and_set_irq(struct devfreq *df,
 					unsigned int tol, unsigned int us,
 					struct mrps_stats *mrps)
 {
 	u32 limit;
-	unsigned int sample_ms = hw->df->profile->polling_ms;
-	unsigned long f = hw->df->previous_freq;
+	unsigned int sample_ms = df->profile->polling_ms;
+	unsigned long f = df->previous_freq;
 	unsigned long t_mrps, m_mrps, l2_cyc;
 
 	mon_disable(L2_H_REQ_MON);
@@ -343,27 +328,23 @@ static unsigned long meas_mrps_and_set_irq(struct cache_hwmon *hw,
 	mon_enable(L2_M_REQ_MON);
 	mon_enable(L2_CYC_MON);
 
-	mrps->mrps[HIGH] = t_mrps - m_mrps;
-	mrps->mrps[MED] = m_mrps;
-	mrps->mrps[LOW] = 0;
+	mrps->high = t_mrps - m_mrps;
+	mrps->med = m_mrps;
+	mrps->low = 0;
 	mrps->busy_percent = mult_frac(l2_cyc, 1000, us) * 100 / f;
 
 	return 0;
 }
 
-static irqreturn_t mon_intr_handler(int irq, void *dev)
+static bool is_valid_mrps_irq(struct devfreq *df)
 {
-	if (mon_overflow(L2_H_REQ_MON) || mon_overflow(L2_M_REQ_MON)) {
-		update_cache_hwmon(dev);
-		return IRQ_HANDLED;
-	}
-	return IRQ_NONE;
+	return mon_overflow(L2_H_REQ_MON) || mon_overflow(L2_M_REQ_MON);
 }
 
-static int start_mrps_hwmon(struct cache_hwmon *hw, struct mrps_stats *mrps)
+static int start_mrps_hwmon(struct devfreq *df, struct mrps_stats *mrps)
 {
 	u32 limit;
-	int ret;
+int ret;
 
 	ret = request_threaded_irq(cache_irq, NULL, mon_intr_handler,
 			  IRQF_ONESHOT | IRQF_SHARED,
@@ -378,7 +359,7 @@ static int start_mrps_hwmon(struct cache_hwmon *hw, struct mrps_stats *mrps)
 	mon_disable(L2_M_REQ_MON);
 	mon_disable(L2_CYC_MON);
 
-	limit = mrps_to_count(mrps->mrps[HIGH], hw->df->profile->polling_ms, 0);
+	limit = mrps_to_count(mrps->high, df->profile->polling_ms, 0);
 	prev_req_start_val = mon_set_limit(L2_H_REQ_MON, limit);
 	mon_set_limit(L2_M_REQ_MON, 0xFFFFFFFF);
 	mon_set_limit(L2_CYC_MON, 0xFFFFFFFF);
@@ -393,10 +374,10 @@ static int start_mrps_hwmon(struct cache_hwmon *hw, struct mrps_stats *mrps)
 	return 0;
 }
 
-static void stop_mrps_hwmon(struct cache_hwmon *hw)
+static void stop_mrps_hwmon(struct devfreq *df)
 {
 	disable_irq(cache_irq);
-	free_irq(cache_irq, hw);
+	free_irq(cache_irq, hw);	
 	global_mon_enable(false);
 	mon_disable(L2_H_REQ_MON);
 	mon_disable(L2_M_REQ_MON);
@@ -435,13 +416,7 @@ static int krait_l2pm_driver_probe(struct platform_device *pdev)
 	if (ret)
 		pr_err("CPUBW hwmon registration failed\n");
 
-	cache_irq = bw_irq;
-	mrps_hwmon.of_node = of_parse_phandle(dev->of_node, "qcom,target-dev",
-					      0);
-	if (!mrps_hwmon.of_node)
-		return -EINVAL;
-
-	ret2 = register_cache_hwmon(dev, &mrps_hwmon);
+	ret2 = register_cache_hwmon(&mrps_hwmon);
 	if (ret2)
 		pr_err("Cache hwmon registration failed\n");
 
