@@ -16,6 +16,22 @@
 #include <linux/debugfs.h>
 #include <linux/types.h>
 #include <trace/events/power.h>
+#include <linux/moduleparam.h>
+
+
+static bool enable_wlan_rx_wake_ws = true;
+module_param(enable_wlan_rx_wake_ws, bool, 0644);
+static bool enable_wlan_ctrl_wake_ws = true;
+module_param(enable_wlan_ctrl_wake_ws, bool, 0644);
+static bool enable_wlan_wake_ws = true;
+module_param(enable_wlan_wake_ws, bool, 0644);
+static bool enable_bluedroid_timer_ws = true;
+module_param(enable_bluedroid_timer_ws, bool, 0644);
+static bool enable_bluesleep_ws = true;
+module_param(enable_bluesleep_ws, bool, 0644);
+
+static bool enable_si_ws = true;
+module_param(enable_si_ws, bool, 0644);
 
 #include "power.h"
 
@@ -407,6 +423,15 @@ EXPORT_SYMBOL_GPL(device_set_wakeup_enable);
 static void wakeup_source_activate(struct wakeup_source *ws)
 {
 	unsigned int cec;
+	if (!enable_wlan_rx_wake_ws && !strcmp(ws->name, "wlan_rx_wake"))
+                return;
+	if (!enable_wlan_ctrl_wake_ws && !strcmp(ws->name, "wlan_ctrl_wake"))
+                return;
+	if (!enable_wlan_wake_ws && !strcmp(ws->name, "wlan_wake"))
+                return;
+
+	if (!enable_bluedroid_timer_ws && !strcmp(ws->name, "bluedroid_timer"))
+		return;
 
 	ws->active = true;
 	ws->active_count++;
@@ -537,6 +562,10 @@ static void wakeup_source_deactivate(struct wakeup_source *ws)
 	if (ws->autosleep_enabled)
 		update_prevent_sleep_time(ws, now);
 
+	if (!enable_si_ws && !strcmp(ws->name, "sensor_ind")) {
+		pr_info("wakeup source sensor_ind activate skipped\n");
+		return;
+	}
 	/*
 	 * Increment the counter of registered wakeup events and decrement the
 	 * couter of wakeup events in progress simultaneously.
